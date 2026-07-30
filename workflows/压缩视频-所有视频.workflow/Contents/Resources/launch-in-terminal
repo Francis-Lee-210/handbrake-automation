@@ -1,0 +1,60 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  print -r -- "用法: launch-in-terminal --flat|--recursive <文件夹> [更多文件夹...]"
+}
+
+mode="${1:-}"
+case "$mode" in
+  --flat|--recursive)
+    shift
+    ;;
+  -h|--help|"")
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+if (( $# == 0 )); then
+  print -ru2 -- "请先在 Finder 中选择一个文件夹。"
+  exit 1
+fi
+
+resources_dir="${0:A:h}"
+worker="$resources_dir/video-compress"
+
+if [[ ! -x "$worker" ]]; then
+  print -ru2 -- "找不到可执行脚本: $worker"
+  exit 1
+fi
+
+cmd="SHOW_PROGRESS=1 "
+cmd+="${(q)worker} ${(q)mode}"
+
+for target in "$@"; do
+  cmd+=" ${(q)target}"
+done
+
+cmd+='; hb_exit_code=$?; echo; if (( hb_exit_code == 0 )); then echo "处理完成。可以关闭这个窗口。"; else echo "处理结束，但有失败项。请查看压缩视频/video-compress.log。"; fi; exit $hb_exit_code'
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  print -r -- "$cmd"
+  exit 0
+fi
+
+command_dir="$(/usr/bin/mktemp -d "/tmp/handbrake-progress.XXXXXX")"
+command_file="$command_dir/run.command"
+
+{
+  print -r -- "#!/bin/zsh"
+  print -r -- "set -o pipefail"
+  print -r -- "$cmd"
+} > "$command_file"
+
+/bin/chmod +x "$command_file"
+/usr/bin/open -a Terminal "$command_file"

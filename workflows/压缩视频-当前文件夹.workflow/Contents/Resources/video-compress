@@ -1,0 +1,315 @@
+#!/bin/zsh
+set -euo pipefail
+
+HANDBRAKECLI="${HANDBRAKECLI:-/opt/homebrew/bin/HandBrakeCLI}"
+PRESET="${HANDBRAKE_PRESET:-1080 原帧率 硬件加速}"
+ORIGINAL_DIR_NAME="${ORIGINAL_DIR_NAME:-原始视频}"
+COMPRESSED_DIR_NAME="${COMPRESSED_DIR_NAME:-压缩视频}"
+LOG_FILE_NAME="${LOG_FILE_NAME:-video-compress.log}"
+SHOW_PROGRESS="${SHOW_PROGRESS:-0}"
+
+usage() {
+  print -r -- "用法: video-compress --flat|--recursive <文件夹> [更多文件夹...]"
+}
+
+notify() {
+  local message="$1"
+  local title="${2:-HandBrake 批量压缩}"
+  message="${message//\"/\\\"}"
+  title="${title//\"/\\\"}"
+  /usr/bin/osascript -e "display notification \"$message\" with title \"$title\"" >/dev/null 2>&1 || true
+}
+
+die() {
+  print -ru2 -- "$1"
+  notify "$1"
+  exit 1
+}
+
+find_top_level_videos() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+
+  /usr/bin/find "$dir" -maxdepth 1 -type f \( \
+    -iname "*.mp4" -o \
+    -iname "*.m4v" -o \
+    -iname "*.mov" -o \
+    -iname "*.mkv" -o \
+    -iname "*.avi" -o \
+    -iname "*.wmv" -o \
+    -iname "*.webm" -o \
+    -iname "*.flv" -o \
+    -iname "*.ts" -o \
+    -iname "*.mts" -o \
+    -iname "*.m2ts" \
+  \) -print0
+}
+
+has_top_level_videos() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 1
+  local first
+  first="$(/usr/bin/find "$dir" -maxdepth 1 -type f \( \
+    -iname "*.mp4" -o \
+    -iname "*.m4v" -o \
+    -iname "*.mov" -o \
+    -iname "*.mkv" -o \
+    -iname "*.avi" -o \
+    -iname "*.wmv" -o \
+    -iname "*.webm" -o \
+    -iname "*.flv" -o \
+    -iname "*.ts" -o \
+    -iname "*.mts" -o \
+    -iname "*.m2ts" \
+  \) -print | /usr/bin/sed -n '1p')"
+  [[ -n "$first" ]]
+}
+
+is_managed_path() {
+  local path="$1"
+  case "$path" in
+    */"$ORIGINAL_DIR_NAME"|*/"$ORIGINAL_DIR_NAME"/*|*/"$COMPRESSED_DIR_NAME"|*/"$COMPRESSED_DIR_NAME"/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+log_line() {
+  local log_file="$1"
+  shift
+  local line
+  line="$(/bin/date '+%F %T') $*"
+  print -r -- "$line" >> "$log_file"
+  if [[ "$SHOW_PROGRESS" == "1" ]]; then
+    print -r -- "$line"
+  fi
+}
+
+move_video_to_originals() {
+  local file="$1"
+  local original_dir="$2"
+  local log_file="$3"
+  local name="${file:t}"
+  local target="$original_dir/$name"
+
+  if [[ -e "$target" ]]; then
+    log_line "$log_file" "跳过移动，目标已存在: $target"
+    return 0
+  fi
+
+  /bin/mv -- "$file" "$target"
+  log_line "$log_file" "已移动原视频: $file -> $target"
+}
+
+has_duplicate_stem() {
+  local file="$1"
+  local dir="${file:h}"
+  local name="${file:t}"
+  local base="${name%.*}"
+  local candidate
+  local candidate_name
+  local candidate_base
+  local -i count=0
+
+  while IFS= read -r -d '' candidate; do
+    candidate_name="${candidate:t}"
+    candidate_base="${candidate_name%.*}"
+    if [[ "$candidate_base" == "$base" ]]; then
+      (( count += 1 ))
+      if (( count > 1 )); then
+        return 0
+      fi
+    fi
+  done < <(find_top_level_videos "$dir")
+
+  return 1
+}
+
+compressed_output_path() {
+  local file="$1"
+  local compressed_dir="$2"
+  local name="${file:t}"
+  local base="${name%.*}"
+  local ext="${name:e:l}"
+
+  if has_duplicate_stem "$file"; then
+    [[ -n "$ext" ]] || ext="video"
+    print -r -- "$compressed_dir/$base ($ext).mp4"
+    return 0
+  fi
+
+  print -r -- "$compressed_dir/$base.mp4"
+}
+
+compress_original_video() {
+  local file="$1"
+  local compressed_dir="$2"
+  local log_file="$3"
+  local output
+  output="$(compressed_output_path "$file" "$compressed_dir")"
+
+  if [[ -e "$output" ]]; then
+    log_line "$log_file" "跳过压缩，输出已存在: $output"
+    return 2
+  fi
+
+  log_line "$log_file" "开始压缩: $file -> $output"
+
+  if [[ "$SHOW_PROGRESS" == "1" ]]; then
+    if "$HANDBRAKECLI" \
+      --preset-import-gui \
+      -i "$file" \
+      -o "$output" \
+      --preset "$PRESET" < /dev/null 2>&1 | /usr/bin/tee -a "$log_file"; then
+      log_line "$log_file" "压缩完成: $output"
+      return 0
+    fi
+
+    log_line "$log_file" "压缩失败: $file"
+    return 1
+  fi
+
+  if "$HANDBRAKECLI" \
+    --preset-import-gui \
+    -i "$file" \
+    -o "$output" \
+    --preset "$PRESET" < /dev/null >> "$log_file" 2>&1; then
+    log_line "$log_file" "压缩完成: $output"
+    return 0
+  fi
+
+  log_line "$log_file" "压缩失败: $file"
+  return 1
+}
+
+process_folder() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+
+  if is_managed_path "$dir"; then
+    return 0
+  fi
+
+  local original_dir="$dir/$ORIGINAL_DIR_NAME"
+  local compressed_dir="$dir/$COMPRESSED_DIR_NAME"
+
+  if ! has_top_level_videos "$dir" && ! has_top_level_videos "$original_dir"; then
+    return 0
+  fi
+
+  /bin/mkdir -p "$original_dir" "$compressed_dir"
+  local log_file="$compressed_dir/$LOG_FILE_NAME"
+  log_line "$log_file" "===== 处理文件夹: $dir ====="
+  log_line "$log_file" "模式预设: $PRESET"
+
+  local -i moved=0
+  local -i compressed=0
+  local -i skipped=0
+  local -i failed=0
+  local file
+
+  while IFS= read -r -d '' file; do
+    if move_video_to_originals "$file" "$original_dir" "$log_file"; then
+      (( moved += 1 ))
+    else
+      (( failed += 1 ))
+    fi
+  done < <(find_top_level_videos "$dir")
+
+  while IFS= read -r -d '' file; do
+    if compress_original_video "$file" "$compressed_dir" "$log_file"; then
+      (( compressed += 1 ))
+    else
+      case "$?" in
+        2) (( skipped += 1 )) ;;
+        *) (( failed += 1 )) ;;
+      esac
+    fi
+  done < <(find_top_level_videos "$original_dir")
+
+  log_line "$log_file" "完成文件夹: moved=$moved compressed=$compressed skipped=$skipped failed=$failed"
+
+  (( failed == 0 ))
+}
+
+process_recursive_root() {
+  local root="$1"
+  local -a dirs
+  local dir
+  local -i failed=0
+
+  while IFS= read -r -d '' dir; do
+    dirs+=("$dir")
+  done < <(/usr/bin/find "$root" -type d -print0)
+
+  for dir in "${dirs[@]}"; do
+    if is_managed_path "$dir"; then
+      continue
+    fi
+    if ! process_folder "$dir"; then
+      (( failed += 1 ))
+    fi
+  done
+
+  (( failed == 0 ))
+}
+
+mode="${1:-}"
+case "$mode" in
+  --flat|--recursive)
+    shift
+    ;;
+  -h|--help|"")
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+(( $# > 0 )) || die "请传入至少一个文件夹。"
+[[ -x "$HANDBRAKECLI" ]] || die "找不到可执行的 HandBrakeCLI: $HANDBRAKECLI"
+
+if [[ "${SKIP_PRESET_CHECK:-0}" != "1" ]]; then
+  if ! "$HANDBRAKECLI" --preset-import-gui --preset-list 2>&1 | /usr/bin/grep -F -- "$PRESET" >/dev/null; then
+    die "没有找到 HandBrake 预设: $PRESET"
+  fi
+fi
+
+notify "开始处理 $# 个文件夹"
+
+typeset -i roots_failed=0
+typeset root
+for root in "$@"; do
+  if [[ ! -d "$root" ]]; then
+    print -ru2 -- "跳过非文件夹: $root"
+    (( roots_failed += 1 ))
+    continue
+  fi
+
+  case "$mode" in
+    --flat)
+      if ! process_folder "$root"; then
+        (( roots_failed += 1 ))
+      fi
+      ;;
+    --recursive)
+      if ! process_recursive_root "$root"; then
+        (( roots_failed += 1 ))
+      fi
+      ;;
+  esac
+done
+
+if (( roots_failed == 0 )); then
+  notify "处理完成"
+  exit 0
+fi
+
+notify "处理完成，但有失败项。请查看压缩视频/$LOG_FILE_NAME"
+exit 1
