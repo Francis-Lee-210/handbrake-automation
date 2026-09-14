@@ -6,9 +6,14 @@ if [[ "${1:-}" == "--preset-import-gui" && "${2:-}" == "--preset-list" ]]; then
   exit 0
 fi
 
+input=""
 output=""
 while (( $# > 0 )); do
   case "$1" in
+    -i)
+      input="$2"
+      shift 2
+      ;;
     -o)
       output="$2"
       shift 2
@@ -20,4 +25,21 @@ while (( $# > 0 )); do
 done
 
 [[ -n "$output" ]] || exit 2
+
+if [[ -n "${FAKE_HANDBRAKE_ORDER_LOG:-}" ]]; then
+  print -r -- "${input:t}" >> "$FAKE_HANDBRAKE_ORDER_LOG"
+fi
+
+for percentage in 0 25 50 75 100; do
+  printf 'Encoding: task 1 of 1, %.2f %%\r' "$percentage"
+  if (( percentage < 100 )) && [[ "${FAKE_HANDBRAKE_STEP_DELAY:-0}" != "0" ]]; then
+    /bin/sleep "$FAKE_HANDBRAKE_STEP_DELAY"
+  fi
+done
+print
+
+if [[ -n "${FAKE_HANDBRAKE_FAIL_PATTERN:-}" && "${input:t}" == ${~FAKE_HANDBRAKE_FAIL_PATTERN} ]]; then
+  exit 1
+fi
+
 print -r -- "fake compressed" > "$output"
