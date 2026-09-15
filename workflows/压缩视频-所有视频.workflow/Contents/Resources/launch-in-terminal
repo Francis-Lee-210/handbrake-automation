@@ -33,10 +33,26 @@ if [[ ! -x "$worker" ]]; then
   exit 1
 fi
 
+targets=()
+for target in "$@"; do
+  if [[ ! -d "$target" ]]; then
+    print -ru2 -- "不是有效的文件夹: $target"
+    exit 1
+  fi
+
+  [[ "$target" == /* ]] || target="$PWD/$target"
+  # The trailing slash preserves path-ending newlines in command substitution.
+  if ! resolved_target="$(builtin cd -q -P -- "$target" && print -r -- "$PWD/")"; then
+    print -ru2 -- "无法访问文件夹: $target"
+    exit 1
+  fi
+  targets+=("${resolved_target%/}")
+done
+
 cmd="SHOW_PROGRESS=1 "
 cmd+="${(q)worker} ${(q)mode}"
 
-for target in "$@"; do
+for target in "${targets[@]}"; do
   cmd+=" ${(q)target}"
 done
 

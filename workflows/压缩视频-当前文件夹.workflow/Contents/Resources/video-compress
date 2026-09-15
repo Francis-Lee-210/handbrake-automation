@@ -1,18 +1,46 @@
 #!/bin/zsh
-set -euo pipefail
+set -u
+setopt PIPE_FAIL NUMERIC_GLOB_SORT
 
 HANDBRAKECLI="${HANDBRAKECLI:-/opt/homebrew/bin/HandBrakeCLI}"
+FFPROBE="${FFPROBE:-/opt/homebrew/bin/ffprobe}"
 PRESET="${HANDBRAKE_PRESET:-1080 原帧率 硬件加速}"
 ORIGINAL_DIR_NAME="${ORIGINAL_DIR_NAME:-原始视频}"
 COMPRESSED_DIR_NAME="${COMPRESSED_DIR_NAME:-压缩视频}"
 LOG_FILE_NAME="${LOG_FILE_NAME:-video-compress.log}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-0}"
 
+typeset -ga LISTED_VIDEOS
+typeset -ga DISCOVERED_DIRS
+typeset -gA SEEN_DIRS
+
+typeset -ga ACTIVE_DIRS
+typeset -ga ACTIVE_LOGS ACTIVE_STATES
+typeset -ga ACTIVE_MOVED
+typeset -ga ACTIVE_COMPRESSED
+typeset -ga ACTIVE_SKIPPED
+typeset -ga ACTIVE_FAILED
+
+typeset -ga TASK_INPUTS
+typeset -ga TASK_OUTPUTS
+typeset -ga TASK_LOGS
+typeset -ga TASK_FOLDER_INDEXES
+typeset -ga TASK_DURATIONS TASK_RECEIPTS
+
+typeset -gi TOTAL_MOVED=0
+typeset -gi TOTAL_COMPRESSED=0
+typeset -gi TOTAL_SKIPPED=0
+typeset -gi TOTAL_FAILED=0
+typeset -gi CANCELLED=0
+typeset -gi BATCH_STARTED_AT=$SECONDS
+typeset -gF 6 TOTAL_WEIGHT=0.0
+
 usage() {
   print -r -- "用法: video-compress --flat|--recursive <文件夹> [更多文件夹...]"
 }
 
 notify() {
+  [[ "${DISABLE_NOTIFICATIONS:-0}" == 1 ]] && return 0
   local message="$1"
   local title="${2:-HandBrake 批量压缩}"
   message="${message//\"/\\\"}"
@@ -26,43 +54,36 @@ die() {
   exit 1
 }
 
-find_top_level_videos() {
-  local dir="$1"
-  [[ -d "$dir" ]] || return 0
+is_video_file() {
+  local file="$1"
+  local extension="${file:e:l}"
 
-  /usr/bin/find "$dir" -maxdepth 1 -type f \( \
-    -iname "*.mp4" -o \
-    -iname "*.m4v" -o \
-    -iname "*.mov" -o \
-    -iname "*.mkv" -o \
-    -iname "*.avi" -o \
-    -iname "*.wmv" -o \
-    -iname "*.webm" -o \
-    -iname "*.flv" -o \
-    -iname "*.ts" -o \
-    -iname "*.mts" -o \
-    -iname "*.m2ts" \
-  \) -print0
+  case "$extension" in
+    mp4|m4v|mov|mkv|avi|wmv|webm|flv|ts|mts|m2ts)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
-has_top_level_videos() {
+list_top_level_videos() {
   local dir="$1"
-  [[ -d "$dir" ]] || return 1
-  local first
-  first="$(/usr/bin/find "$dir" -maxdepth 1 -type f \( \
-    -iname "*.mp4" -o \
-    -iname "*.m4v" -o \
-    -iname "*.mov" -o \
-    -iname "*.mkv" -o \
-    -iname "*.avi" -o \
-    -iname "*.wmv" -o \
-    -iname "*.webm" -o \
-    -iname "*.flv" -o \
-    -iname "*.ts" -o \
-    -iname "*.mts" -o \
-    -iname "*.m2ts" \
-  \) -print | /usr/bin/sed -n '1p')"
-  [[ -n "$first" ]]
+  local candidate
+  local -a candidates
+  LISTED_VIDEOS=()
+
+  [[ -d "$dir" ]] || return 0
+  candidates=("$dir"/*(DN.))
+
+  for candidate in "${candidates[@]}"; do
+    if is_video_file "$candidate"; then
+      LISTED_VIDEOS+=("$candidate")
+    fi
+  done
+
+  LISTED_VIDEOS=("${(@in)LISTED_VIDEOS}")
 }
 
 is_managed_path() {
@@ -77,15 +98,33 @@ is_managed_path() {
   esac
 }
 
-log_line() {
-  local log_file="$1"
-  shift
-  local line
-  line="$(/bin/date '+%F %T') $*"
-  print -r -- "$line" >> "$log_file"
-  if [[ "$SHOW_PROGRESS" == "1" ]]; then
-    print -r -- "$line"
-  fi
+collect_directory_tree() {
+  local dir="${1:A}"
+  local child
+  local -a children
+
+  [[ -d "$dir" ]] || return 0
+  is_managed_path "$dir" && return 0
+  [[ -n "${SEEN_DIRS[$dir]-}" ]] && return 0
+
+  SEEN_DIRS[$dir]=1
+  DISCOVERED_DIRS+=("$dir")
+
+  children=("$dir"/*(DN/))
+  children=("${(@in)children}")
+  for child in "${children[@]}"; do
+    collect_directory_tree "$child"
+  done
+}
+
+add_flat_directory() {
+  local dir="${1:A}"
+  [[ -d "$dir" ]] || return 0
+  is_managed_path "$dir" && return 0
+  [[ -n "${SEEN_DIRS[$dir]-}" ]] && return 0
+
+  SEEN_DIRS[$dir]=1
+  DISCOVERED_DIRS+=("$dir")
 }
 
 move_video_to_originals() {
@@ -95,167 +134,292 @@ move_video_to_originals() {
   local name="${file:t}"
   local target="$original_dir/$name"
 
-  if [[ -e "$target" ]]; then
-    log_line "$log_file" "跳过移动，目标已存在: $target"
+  if [[ -e "$target" || -L "$target" ]]; then
+    log_line "$log_file" "跳过移动，目标已存在: $target" || return 1
+    return 2
+  fi
+
+  if /bin/mv -- "$file" "$target"; then
+    log_line "$log_file" "已移动原视频: $file -> $target" || return 1
     return 0
   fi
 
-  /bin/mv -- "$file" "$target"
-  log_line "$log_file" "已移动原视频: $file -> $target"
-}
-
-has_duplicate_stem() {
-  local file="$1"
-  local dir="${file:h}"
-  local name="${file:t}"
-  local base="${name%.*}"
-  local candidate
-  local candidate_name
-  local candidate_base
-  local -i count=0
-
-  while IFS= read -r -d '' candidate; do
-    candidate_name="${candidate:t}"
-    candidate_base="${candidate_name%.*}"
-    if [[ "$candidate_base" == "$base" ]]; then
-      (( count += 1 ))
-      if (( count > 1 )); then
-        return 0
-      fi
-    fi
-  done < <(find_top_level_videos "$dir")
-
+  log_line "$log_file" "移动失败: $file -> $target"
   return 1
 }
 
 compressed_output_path() {
   local file="$1"
   local compressed_dir="$2"
+  local duplicate_stem="$3"
   local name="${file:t}"
   local base="${name%.*}"
-  local ext="${name:e:l}"
+  local extension="${name:e:l}"
 
-  if has_duplicate_stem "$file"; then
-    [[ -n "$ext" ]] || ext="video"
-    print -r -- "$compressed_dir/$base ($ext).mp4"
+  if [[ "$duplicate_stem" == "1" ]]; then
+    [[ -n "$extension" ]] || extension="video"
+    print -r -- "$compressed_dir/$base ($extension).mp4"
     return 0
   fi
 
   print -r -- "$compressed_dir/$base.mp4"
 }
 
-compress_original_video() {
-  local file="$1"
-  local compressed_dir="$2"
-  local log_file="$3"
-  local output
-  output="$(compressed_output_path "$file" "$compressed_dir")"
+prepare_folder() {
+  local dir="$1" original_dir="$1/$ORIGINAL_DIR_NAME" compressed_dir="$1/$COMPRESSED_DIR_NAME"
+  local state_dir="$compressed_dir/.video-compress-state" log_file="$compressed_dir/$LOG_FILE_NAME"
+  local file output base stem_key receipt candidate output_name
+  local -a root_videos original_videos
+  local -A stem_counts reserved_outputs
+  local -i folder_index move_result duplicate_stem suffix
 
-  if [[ -e "$output" ]]; then
-    log_line "$log_file" "跳过压缩，输出已存在: $output"
-    return 2
-  fi
+  safe_directory "$dir" || { print -ru2 -- "拒绝不安全或共享可写的目录: ${(q)dir}"; return 1; }
+  for candidate in "$original_dir" "$compressed_dir" "$state_dir"; do
+    safe_storage_entries "$candidate" || { print -ru2 -- "拒绝不安全的整理路径: ${(q)candidate}"; return 1; }
+  done
+  list_top_level_videos "$dir"
+  root_videos=("${LISTED_VIDEOS[@]}")
+  list_top_level_videos "$original_dir"
+  original_videos=("${LISTED_VIDEOS[@]}")
+  (( ${#root_videos} + ${#original_videos} > 0 )) || return 0
 
-  log_line "$log_file" "开始压缩: $file -> $output"
-
-  if [[ "$SHOW_PROGRESS" == "1" ]]; then
-    if "$HANDBRAKECLI" \
-      --preset-import-gui \
-      -i "$file" \
-      -o "$output" \
-      --preset "$PRESET" < /dev/null 2>&1 | /usr/bin/tee -a "$log_file"; then
-      log_line "$log_file" "压缩完成: $output"
-      return 0
-    fi
-
-    log_line "$log_file" "压缩失败: $file"
+  /bin/mkdir -p "$original_dir" "$compressed_dir" || return 1
+  local -A original_identity compressed_identity
+  zstat -L -H original_identity -- "$original_dir" || return 1
+  zstat -L -H compressed_identity -- "$compressed_dir" || return 1
+  if (( original_identity[device] == compressed_identity[device] && original_identity[inode] == compressed_identity[inode] )); then
+    print -ru2 -- "原始视频与压缩视频目录不能指向同一位置。"
     return 1
   fi
-
-  if "$HANDBRAKECLI" \
-    --preset-import-gui \
-    -i "$file" \
-    -o "$output" \
-    --preset "$PRESET" < /dev/null >> "$log_file" 2>&1; then
-    log_line "$log_file" "压缩完成: $output"
-    return 0
+  if [[ ! -d "$state_dir" ]]; then
+    /bin/mkdir -m 0700 "$state_dir" || return 1
   fi
-
-  log_line "$log_file" "压缩失败: $file"
-  return 1
-}
-
-process_folder() {
-  local dir="$1"
-  [[ -d "$dir" ]] || return 0
-
-  if is_managed_path "$dir"; then
-    return 0
+  safe_directory "$state_dir" || return 1
+  if ! /bin/mkdir -m 0700 "$state_dir/lock" 2>/dev/null; then
+    print -ru2 -- "目录已锁定；请确认没有任务运行后检查: ${(q)state_dir}/lock"
+    return 1
   fi
+  HELD_LOCKS+=("$state_dir/lock")
+  open_folder_log "$log_file" || return 1
+  log_line "$log_file" "===== 处理文件夹: $dir =====" || return 1
+  log_line "$log_file" "模式预设: $PRESET" || return 1
 
-  local original_dir="$dir/$ORIGINAL_DIR_NAME"
-  local compressed_dir="$dir/$COMPRESSED_DIR_NAME"
-
-  if ! has_top_level_videos "$dir" && ! has_top_level_videos "$original_dir"; then
-    return 0
-  fi
-
-  /bin/mkdir -p "$original_dir" "$compressed_dir"
-  local log_file="$compressed_dir/$LOG_FILE_NAME"
-  log_line "$log_file" "===== 处理文件夹: $dir ====="
-  log_line "$log_file" "模式预设: $PRESET"
-
-  local -i moved=0
-  local -i compressed=0
-  local -i skipped=0
-  local -i failed=0
-  local file
-
-  while IFS= read -r -d '' file; do
-    if move_video_to_originals "$file" "$original_dir" "$log_file"; then
-      (( moved += 1 ))
-    else
-      (( failed += 1 ))
-    fi
-  done < <(find_top_level_videos "$dir")
-
-  while IFS= read -r -d '' file; do
-    if compress_original_video "$file" "$compressed_dir" "$log_file"; then
-      (( compressed += 1 ))
-    else
-      case "$?" in
-        2) (( skipped += 1 )) ;;
-        *) (( failed += 1 )) ;;
-      esac
-    fi
-  done < <(find_top_level_videos "$original_dir")
-
-  log_line "$log_file" "完成文件夹: moved=$moved compressed=$compressed skipped=$skipped failed=$failed"
-
-  (( failed == 0 ))
-}
-
-process_recursive_root() {
-  local root="$1"
-  local -a dirs
-  local dir
-  local -i failed=0
-
-  while IFS= read -r -d '' dir; do
-    dirs+=("$dir")
-  done < <(/usr/bin/find "$root" -type d -print0)
-
-  for dir in "${dirs[@]}"; do
-    if is_managed_path "$dir"; then
+  ACTIVE_DIRS+=("$dir")
+  ACTIVE_LOGS+=("$log_file")
+  ACTIVE_STATES+=("$state_dir")
+  folder_index=${#ACTIVE_DIRS}
+  ACTIVE_MOVED[$folder_index]=0
+  ACTIVE_COMPRESSED[$folder_index]=0
+  ACTIVE_SKIPPED[$folder_index]=0
+  ACTIVE_FAILED[$folder_index]=0
+  for file in "${root_videos[@]}"; do
+    move_result=0
+    move_video_to_originals "$file" "$original_dir" "$log_file" || move_result=$?
+    case "$move_result" in
+      0) (( ACTIVE_MOVED[$folder_index] += 1, TOTAL_MOVED += 1 )) ;;
+      2) (( ACTIVE_SKIPPED[$folder_index] += 1, TOTAL_SKIPPED += 1 )) ;;
+      *) (( ACTIVE_FAILED[$folder_index] += 1, TOTAL_FAILED += 1 )) ;;
+    esac
+  done
+  list_top_level_videos "$original_dir"
+  original_videos=("${LISTED_VIDEOS[@]}")
+  for file in "${original_videos[@]}"; do
+    base="${file:t}"
+    stem_key="${${base%.*}:l}"
+    stem_counts[$stem_key]=$(( ${stem_counts[$stem_key]:-0} + 1 ))
+  done
+  for file in "${original_videos[@]}"; do
+    receipt="$(receipt_path "$file" "$state_dir")" || return 1
+    if completed_output "$file" "$receipt" "$compressed_dir"; then
+      log_line "$log_file" "跳过压缩，完成记录已核对: $REPLY" || return 1
+      (( ACTIVE_SKIPPED[$folder_index] += 1, TOTAL_SKIPPED += 1 ))
       continue
     fi
-    if ! process_folder "$dir"; then
-      (( failed += 1 ))
+    base="${file:t}"
+    stem_key="${${base%.*}:l}"
+    duplicate_stem=0
+    (( ${stem_counts[$stem_key]:-0} > 1 )) && duplicate_stem=1
+    candidate="$(compressed_output_path "$file" "$compressed_dir" "$duplicate_stem")"
+    # Keep legacy/unverified files untouched; reserve every output before encoding.
+    output="$candidate"
+    suffix=1
+    while true; do
+      output_name="${output:t}"
+      if (( $(LC_ALL=C; print -r -- ${#output_name}) > 240 )); then
+        output="$compressed_dir/video-${receipt:t:r}-$suffix.mp4"
+      fi
+      if [[ ! -e "$output" && ! -L "$output" && -z "${reserved_outputs[${output:l}]-}" ]]; then
+        break
+      fi
+      (( suffix += 1 ))
+      output="${candidate:r} [$suffix].mp4"
+    done
+    reserved_outputs[${output:l}]=1
+    TASK_INPUTS+=("$file")
+    TASK_OUTPUTS+=("$output")
+    TASK_LOGS+=("$log_file")
+    TASK_FOLDER_INDEXES+=("$folder_index")
+    TASK_RECEIPTS+=("$receipt")
+  done
+  return 0
+}
+
+probe_duration() {
+  local file="$1"
+  local duration_text
+
+  [[ -x "$FFPROBE" ]] || {
+    print -r -- "0"
+    return 0
+  }
+
+  duration_text="$("$FFPROBE" \
+    -v error \
+    -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$file" 2>/dev/null | /usr/bin/sed -n '1p')" || duration_text=""
+
+  if [[ "$duration_text" =~ '^[0-9]+([.][0-9]+)?$' ]] && (( duration_text > 0.0 )); then
+    print -r -- "$duration_text"
+    return 0
+  fi
+
+  print -r -- "0"
+}
+
+probe_task_durations() {
+  local -i task_total=${#TASK_INPUTS}
+  local -i task_index known_count=0
+  local -F 6 duration_value known_sum=0.0 average_duration=1.0
+
+  TASK_DURATIONS=()
+  TOTAL_WEIGHT=0.0
+
+  if [[ ! -x "$FFPROBE" ]]; then
+    for (( task_index = 1; task_index <= task_total; task_index += 1 )); do
+      TASK_DURATIONS+=("1")
+    done
+    TOTAL_WEIGHT=$task_total
+    finish_phase "未找到 ffprobe，将按文件数量估算总体进度。"
+    return 0
+  fi
+
+  for (( task_index = 1; task_index <= task_total; task_index += 1 )); do
+    render_phase "读取视频时长: $task_index / $task_total"
+    duration_value="$(probe_duration "${TASK_INPUTS[$task_index]}")"
+    TASK_DURATIONS+=("$duration_value")
+    if (( duration_value > 0.0 )); then
+      (( known_sum += duration_value ))
+      (( known_count += 1 ))
     fi
   done
 
-  (( failed == 0 ))
+  if (( known_count > 0 )); then
+    (( average_duration = known_sum / known_count ))
+  fi
+
+  for (( task_index = 1; task_index <= task_total; task_index += 1 )); do
+    duration_value="${TASK_DURATIONS[$task_index]}"
+    if (( duration_value <= 0.0 )); then
+      TASK_DURATIONS[$task_index]="$average_duration"
+      duration_value="$average_duration"
+    fi
+    (( TOTAL_WEIGHT += duration_value ))
+  done
+
+  finish_phase "已读取 $task_total 个待压缩视频的时长。"
 }
+
+run_handbrake_task() {
+  local -i index="$1" folder_index="${TASK_FOLDER_INDEXES[$1]}"
+  local file="${TASK_INPUTS[$1]}" output="${TASK_OUTPUTS[$1]}" log_file="${TASK_LOGS[$1]}"
+  local receipt="${TASK_RECEIPTS[$1]}" state_dir="${ACTIVE_STATES[$folder_index]}"
+  local staged_dir staged input_signature descriptor="${LOG_FDS[$log_file]}" hb_line
+  local -i encode_result=0
+  safe_directory "${output:h}" && safe_directory "$state_dir" || return 1
+  input_signature="$(file_signature "$file")" || return 1
+  staged_dir="$(/usr/bin/mktemp -d "$state_dir/job.XXXXXXXX")" || return 1
+  STAGING_DIRS+=("$staged_dir")
+  safe_directory "$staged_dir" || return 1
+  staged="$staged_dir/output.mp4"
+  log_line "$log_file" "开始压缩: $file -> $output" || return 1
+
+  if [[ "$SHOW_PROGRESS" == 1 ]]; then
+    "$HANDBRAKECLI" --preset-import-gui -i "$file" -o "$staged" --preset "$PRESET" < /dev/null 2>&1 |
+      /usr/bin/tr -u '\r' '\n' |
+      while IFS= read -r hb_line || [[ -n "$hb_line" ]]; do
+        print -r -- "$hb_line" >& "$descriptor" || return 1
+        if [[ "$hb_line" =~ 'Encoding:[^%]*[[:space:],]([0-9]+([.][0-9]+)?)[[:space:]]*%' ]]; then
+          render_batch_progress "$index" "$match[1]"
+        fi
+      done || encode_result=$?
+  else
+    "$HANDBRAKECLI" --preset-import-gui -i "$file" -o "$staged" --preset "$PRESET" \
+      < /dev/null >& "$descriptor" 2>&1 || encode_result=$?
+  fi
+  (( CANCELLED == 0 )) || return "$CANCELLED"
+
+  if (( encode_result == 0 )) && [[ -s "$staged" ]] && safe_regular_file "$staged"; then
+    if [[ -x "$FFPROBE" ]]; then
+      local video_stream
+      video_stream="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "$staged" 2>/dev/null)" || encode_result=1
+      [[ "$video_stream" == video ]] || encode_result=1
+    fi
+  else
+    encode_result=1
+  fi
+  if (( encode_result == 0 )) && publish_output "$staged" "$output" "$file" "$receipt" "$input_signature"; then
+    log_line "$log_file" "压缩完成: $output" || return 1
+    /bin/rm -rf -- "$staged_dir"
+    return 0
+  fi
+  log_line "$log_file" "压缩失败，原视频已保留: $file"
+  /bin/rm -rf -- "$staged_dir"
+  return 1
+}
+
+run_compression_tasks() {
+  local -i task_total=${#TASK_INPUTS} task_index folder_index task_result
+  (( task_total > 0 )) || return 0
+  probe_task_durations
+  PROGRESS[started_at]=$SECONDS
+  PROGRESS[completed_weight]=0
+  for (( task_index = 1; task_index <= task_total; task_index += 1 )); do
+    folder_index="${TASK_FOLDER_INDEXES[$task_index]}"
+    render_batch_progress "$task_index" 0
+    task_result=0
+    run_handbrake_task "$task_index" || task_result=$?
+    (( CANCELLED == 0 )) || exit "$CANCELLED"
+    case "$task_result" in
+      0) (( ACTIVE_COMPRESSED[$folder_index] += 1, TOTAL_COMPRESSED += 1 )) ;;
+      *) (( ACTIVE_FAILED[$folder_index] += 1, TOTAL_FAILED += 1 )) ;;
+    esac
+    render_batch_progress "$task_index" 100
+    (( PROGRESS[completed_weight] += TASK_DURATIONS[task_index] ))
+    [[ "$SHOW_PROGRESS" != 1 || ! -t 1 ]] || print
+  done
+  return 0
+}
+
+finish_folder_logs() {
+  local -i folder_index failed=0
+  for (( folder_index = 1; folder_index <= ${#ACTIVE_DIRS}; folder_index += 1 )); do
+    log_line "${ACTIVE_LOGS[$folder_index]}" \
+      "完成文件夹: moved=${ACTIVE_MOVED[$folder_index]} compressed=${ACTIVE_COMPRESSED[$folder_index]} skipped=${ACTIVE_SKIPPED[$folder_index]} failed=${ACTIVE_FAILED[$folder_index]}" || failed=1
+  done
+  return "$failed"
+}
+
+resources_dir="${0:A:h}"
+source "$resources_dir/video-compress-fs.zsh" || exit 1
+source "$resources_dir/video-compress-progress.zsh" || exit 1
+zmodload zsh/system
+typeset -gi WORKER_PID=$sysparams[pid]
+TRAPEXIT() { if (( sysparams[pid] == WORKER_PID )); then cleanup_resources; fi; }
+# Exit after foreground pipelines unwind, not from inside their signal handler.
+TRAPINT() { CANCELLED=130; }
+TRAPTERM() { CANCELLED=143; }
+TRAPHUP() { CANCELLED=129; }
 
 mode="${1:-}"
 case "$mode" in
@@ -273,7 +437,17 @@ case "$mode" in
 esac
 
 (( $# > 0 )) || die "请传入至少一个文件夹。"
+for component in "$ORIGINAL_DIR_NAME" "$COMPRESSED_DIR_NAME" "$LOG_FILE_NAME"; do
+  safe_component "$component" || die "整理目录与日志名称必须是单个安全路径组件。"
+done
+[[ "$ORIGINAL_DIR_NAME" != "$COMPRESSED_DIR_NAME" ]] || die "原始视频和压缩视频目录不能相同。"
+[[ "$LOG_FILE_NAME" != .video-compress-state ]] || die "日志名称与内部状态目录冲突。"
 [[ -x "$HANDBRAKECLI" ]] || die "找不到可执行的 HandBrakeCLI: $HANDBRAKECLI"
+
+if [[ ! -x "$FFPROBE" ]]; then
+  discovered_ffprobe="$(command -v ffprobe 2>/dev/null || true)"
+  [[ -n "$discovered_ffprobe" ]] && FFPROBE="$discovered_ffprobe"
+fi
 
 if [[ "${SKIP_PRESET_CHECK:-0}" != "1" ]]; then
   if ! "$HANDBRAKECLI" --preset-import-gui --preset-list 2>&1 | /usr/bin/grep -F -- "$PRESET" >/dev/null; then
@@ -281,35 +455,62 @@ if [[ "${SKIP_PRESET_CHECK:-0}" != "1" ]]; then
   fi
 fi
 
-notify "开始处理 $# 个文件夹"
+typeset -a valid_roots
+typeset root dir
+typeset -i directory_index
 
-typeset -i roots_failed=0
-typeset root
 for root in "$@"; do
-  if [[ ! -d "$root" ]]; then
+  if [[ -d "$root" ]]; then
+    valid_roots+=("${root:A}")
+  else
     print -ru2 -- "跳过非文件夹: $root"
-    (( roots_failed += 1 ))
-    continue
+    (( TOTAL_FAILED += 1 ))
   fi
+done
 
+valid_roots=("${(@in)valid_roots}")
+(( ${#valid_roots} > 0 )) || die "没有可处理的文件夹。"
+
+notify "开始扫描并整理 ${#valid_roots} 个文件夹"
+render_phase "正在按名称扫描文件夹..."
+
+for root in "${valid_roots[@]}"; do
   case "$mode" in
     --flat)
-      if ! process_folder "$root"; then
-        (( roots_failed += 1 ))
-      fi
+      add_flat_directory "$root"
       ;;
     --recursive)
-      if ! process_recursive_root "$root"; then
-        (( roots_failed += 1 ))
-      fi
+      collect_directory_tree "$root"
       ;;
   esac
 done
 
-if (( roots_failed == 0 )); then
-  notify "处理完成"
+finish_phase "已按名称发现 ${#DISCOVERED_DIRS} 个文件夹。"
+
+for (( directory_index = 1; directory_index <= ${#DISCOVERED_DIRS}; directory_index += 1 )); do
+  (( CANCELLED == 0 )) || exit "$CANCELLED"
+  dir="${DISCOVERED_DIRS[$directory_index]}"
+  render_phase "整理文件夹: $directory_index / ${#DISCOVERED_DIRS}  ${dir:t}"
+  if ! prepare_folder "$dir"; then
+    (( TOTAL_FAILED += 1 ))
+  fi
+done
+
+finish_phase "整理完成：移动 $TOTAL_MOVED，待压缩 ${#TASK_INPUTS}，跳过 $TOTAL_SKIPPED。"
+(( CANCELLED == 0 )) || exit "$CANCELLED"
+run_compression_tasks
+finish_folder_logs || (( TOTAL_FAILED += 1 ))
+
+if [[ "$SHOW_PROGRESS" == "1" ]]; then
+  batch_elapsed="$(format_clock "$(( SECONDS - BATCH_STARTED_AT ))")"
+  print
+  print -r -- "批次完成：成功 $TOTAL_COMPRESSED，跳过 $TOTAL_SKIPPED，失败 $TOTAL_FAILED，总耗时 $batch_elapsed。"
+fi
+
+if (( TOTAL_FAILED == 0 )); then
+  notify "处理完成：成功 $TOTAL_COMPRESSED，跳过 $TOTAL_SKIPPED"
   exit 0
 fi
 
-notify "处理完成，但有失败项。请查看压缩视频/$LOG_FILE_NAME"
+notify "处理完成，但有 $TOTAL_FAILED 个失败项。请查看压缩视频/$LOG_FILE_NAME"
 exit 1

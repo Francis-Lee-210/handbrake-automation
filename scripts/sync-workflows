@@ -1,0 +1,74 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  print -r -- "Usage: sync-workflows [--check]"
+}
+
+check_only=0
+if (( $# > 1 )); then
+  usage >&2
+  exit 2
+fi
+case "${1:-}" in
+  "") ;;
+  --check) check_only=1 ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+repo_root="${0:A:h:h}"
+resource_dirs=("$repo_root"/workflows/*.workflow/Contents/Resources(N/))
+if (( ${#resource_dirs[@]} != 2 )); then
+  print -ru2 -- "Expected exactly two workflow Resources directories: $repo_root/workflows"
+  exit 1
+fi
+
+script_names=(
+  video-compress launch-in-terminal
+  video-compress-fs.zsh video-compress-progress.zsh
+)
+for name in "${script_names[@]}"; do
+  source_file="$repo_root/bin/$name"
+  if [[ ! -f "$source_file" ]]; then
+    print -ru2 -- "Missing canonical script: $source_file"
+    exit 1
+  fi
+  if [[ "$name" == video-compress || "$name" == launch-in-terminal ]] &&
+     [[ ! -x "$source_file" ]]; then
+    print -ru2 -- "Non-executable canonical script: $source_file"
+    exit 1
+  fi
+done
+
+zmodload zsh/stat
+typeset -A source_info bundled_info
+result=0
+for name in "${script_names[@]}"; do
+  source_file="$repo_root/bin/$name"
+  zstat -H source_info -- "$source_file"
+  for resource_dir in "${resource_dirs[@]}"; do
+    bundled_file="$resource_dir/$name"
+    if (( ! check_only )); then
+      /bin/cp -p "$source_file" "$bundled_file"
+      continue
+    fi
+
+    if [[ ! -f "$bundled_file" ]]; then
+      print -ru2 -- "Missing bundled script: $bundled_file"
+      result=1
+      continue
+    fi
+    if ! /usr/bin/cmp -s "$source_file" "$bundled_file"; then
+      print -ru2 -- "Content differs: $bundled_file"
+      result=1
+    fi
+    zstat -H bundled_info -- "$bundled_file"
+    if (( (source_info[mode] & 8#111) != (bundled_info[mode] & 8#111) )); then
+      print -ru2 -- "Executable bits differ: $bundled_file"
+      result=1
+    fi
+  done
+done
+
+exit "$result"
