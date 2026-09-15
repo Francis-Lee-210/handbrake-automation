@@ -1,0 +1,32 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Syntax and bundle checks
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          for script in bin/* test-bin/* scripts/*; do
+            /bin/zsh -n "$script"
+          done
+          for metadata in workflows/**/*.plist workflows/**/*.wflow; do
+            /usr/bin/plutil -lint "$metadata"
+          done
+          scripts/sync-workflows --check
+          git diff --check
+      - name: Regression tests
+        run: PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -v

@@ -1,2 +1,5 @@
 .DS_Store
 *.log
+/reviews/
+__pycache__/
+*.pyc

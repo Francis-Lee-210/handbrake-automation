@@ -29,6 +29,12 @@ done
 if [[ -n "${FAKE_HANDBRAKE_ORDER_LOG:-}" ]]; then
   print -r -- "${input:t}" >> "$FAKE_HANDBRAKE_ORDER_LOG"
 fi
+if [[ -n "${FAKE_HANDBRAKE_CALLS:-}" ]]; then
+  printf '%s\0' "$input" >> "$FAKE_HANDBRAKE_CALLS"
+fi
+
+# Model the partial output left behind by a real failed/interrupted encoder.
+print -r -- "partial" > "$output"
 
 for percentage in 0 25 50 75 100; do
   printf 'Encoding: task 1 of 1, %.2f %%\r' "$percentage"
@@ -42,4 +48,8 @@ if [[ -n "${FAKE_HANDBRAKE_FAIL_PATTERN:-}" && "${input:t}" == ${~FAKE_HANDBRAKE
   exit 1
 fi
 
-print -r -- "fake compressed" > "$output"
+if [[ "${FAKE_HANDBRAKE_EMPTY_SUCCESS:-0}" == 1 ]]; then
+  : > "$output"
+else
+  print -r -- "fake compressed: ${input:t}" > "$output"
+fi
