@@ -30,6 +30,7 @@ class WorkerTests(unittest.TestCase):
             FAKE_HANDBRAKE_CALLS=str(self.calls),
             DISABLE_NOTIFICATIONS="1",
             SHOW_PROGRESS="1",
+            VIDEO_COMPRESS_CONFIG="none",
         )
 
     def video(self, name, root=None):

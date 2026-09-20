@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag and version
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" == "v$(<VERSION)" ]]
+      - name: Verify
+        run: scripts/check
+      - name: Package
+        run: scripts/package-release
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS \
+            --verify-tag --title "HandBrake Finder Automation $GITHUB_REF_NAME" \
+            --notes-file CHANGELOG.md

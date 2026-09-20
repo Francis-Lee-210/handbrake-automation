@@ -12,7 +12,7 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ZSH = "/bin/zsh"
 ENTRY_POINTS = ("video-compress", "launch-in-terminal")
-HELPER_NAMES = ("video-compress-fs.zsh", "video-compress-progress.zsh")
+HELPER_NAMES = ("video-compress-fs.zsh", "video-compress-progress.zsh", "video-compress-config.zsh")
 SCRIPT_NAMES = ENTRY_POINTS + HELPER_NAMES
 EXECUTE_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
 

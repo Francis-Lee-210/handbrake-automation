@@ -2,14 +2,6 @@
 set -u
 setopt PIPE_FAIL NUMERIC_GLOB_SORT
 
-HANDBRAKECLI="${HANDBRAKECLI:-/opt/homebrew/bin/HandBrakeCLI}"
-FFPROBE="${FFPROBE:-/opt/homebrew/bin/ffprobe}"
-PRESET="${HANDBRAKE_PRESET:-1080 原帧率 硬件加速}"
-ORIGINAL_DIR_NAME="${ORIGINAL_DIR_NAME:-原始视频}"
-COMPRESSED_DIR_NAME="${COMPRESSED_DIR_NAME:-压缩视频}"
-LOG_FILE_NAME="${LOG_FILE_NAME:-video-compress.log}"
-SHOW_PROGRESS="${SHOW_PROGRESS:-0}"
-
 typeset -ga LISTED_VIDEOS
 typeset -ga DISCOVERED_DIRS
 typeset -gA SEEN_DIRS
@@ -36,16 +28,24 @@ typeset -gi BATCH_STARTED_AT=$SECONDS
 typeset -gF 6 TOTAL_WEIGHT=0.0
 
 usage() {
-  print -r -- "用法: video-compress --flat|--recursive <文件夹> [更多文件夹...]"
+  print -r -- 'Usage / 用法: video-compress --flat|--recursive <folder> [more folders...]'
+  print -r -- '  --flat        Process only the selected folders / 仅当前文件夹'
+  print -r -- '  --recursive   Include subfolders / 包括子文件夹'
+  print -r -- '  --doctor      Check configuration and dependencies without changing videos'
+  print -r -- '  --help        Show this help'
+  print -r -- 'Configuration: ~/.config/handbrake-automation/config (see config.example)'
+  print -r -- 'Source videos are MOVED into 原始视频/ and retained; MP4 files go into 压缩视频/.'
 }
 
 notify() {
   [[ "${DISABLE_NOTIFICATIONS:-0}" == 1 ]] && return 0
   local message="$1"
   local title="${2:-HandBrake 批量压缩}"
-  message="${message//\"/\\\"}"
-  title="${title//\"/\\\"}"
-  /usr/bin/osascript -e "display notification \"$message\" with title \"$title\"" >/dev/null 2>&1 || true
+  /usr/bin/osascript - "$message" "$title" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run notificationArguments
+  display notification (item 1 of notificationArguments) with title (item 2 of notificationArguments)
+end run
+APPLESCRIPT
 }
 
 die() {
@@ -345,7 +345,7 @@ run_handbrake_task() {
   log_line "$log_file" "开始压缩: $file -> $output" || return 1
 
   if [[ "$SHOW_PROGRESS" == 1 ]]; then
-    "$HANDBRAKECLI" --preset-import-gui -i "$file" -o "$staged" --preset "$PRESET" < /dev/null 2>&1 |
+    "$HANDBRAKECLI" "${PRESET_IMPORT_ARGS[@]}" -i "$file" -o "$staged" --preset "$PRESET" --format av_mp4 < /dev/null 2>&1 |
       /usr/bin/tr -u '\r' '\n' |
       while IFS= read -r hb_line || [[ -n "$hb_line" ]]; do
         print -r -- "$hb_line" >& "$descriptor" || return 1
@@ -354,7 +354,7 @@ run_handbrake_task() {
         fi
       done || encode_result=$?
   else
-    "$HANDBRAKECLI" --preset-import-gui -i "$file" -o "$staged" --preset "$PRESET" \
+    "$HANDBRAKECLI" "${PRESET_IMPORT_ARGS[@]}" -i "$file" -o "$staged" --preset "$PRESET" --format av_mp4 \
       < /dev/null >& "$descriptor" 2>&1 || encode_result=$?
   fi
   (( CANCELLED == 0 )) || return "$CANCELLED"
@@ -426,6 +426,10 @@ case "$mode" in
   --flat|--recursive)
     shift
     ;;
+  --doctor)
+    shift
+    (( $# == 0 )) || { usage >&2; exit 2; }
+    ;;
   -h|--help|"")
     usage
     exit 0
@@ -436,23 +440,36 @@ case "$mode" in
     ;;
 esac
 
-(( $# > 0 )) || die "请传入至少一个文件夹。"
+source "$resources_dir/video-compress-config.zsh" || exit 1
+load_video_compress_config || exit 1
+PRESET="$HANDBRAKE_PRESET"
+typeset -a PRESET_IMPORT_ARGS
+[[ "$HANDBRAKE_IMPORT_GUI" == 1 ]] && PRESET_IMPORT_ARGS=(--preset-import-gui)
+if [[ "$mode" == --doctor ]]; then
+  print -r -- "Configuration: $VIDEO_COMPRESS_CONFIG_PATH"
+  print -r -- "HandBrakeCLI: ${HANDBRAKECLI:-not found}"
+  print -r -- "Preset: $PRESET (import GUI: $HANDBRAKE_IMPORT_GUI)"
+  print -r -- "ffprobe: ${FFPROBE:-not found (optional)}"
+  print -r -- "Folders: $ORIGINAL_DIR_NAME / $COMPRESSED_DIR_NAME"
+else
+  (( $# > 0 )) || die "请传入至少一个文件夹。"
+fi
 for component in "$ORIGINAL_DIR_NAME" "$COMPRESSED_DIR_NAME" "$LOG_FILE_NAME"; do
   safe_component "$component" || die "整理目录与日志名称必须是单个安全路径组件。"
 done
 [[ "$ORIGINAL_DIR_NAME" != "$COMPRESSED_DIR_NAME" ]] || die "原始视频和压缩视频目录不能相同。"
 [[ "$LOG_FILE_NAME" != .video-compress-state ]] || die "日志名称与内部状态目录冲突。"
-[[ -x "$HANDBRAKECLI" ]] || die "找不到可执行的 HandBrakeCLI: $HANDBRAKECLI"
-
-if [[ ! -x "$FFPROBE" ]]; then
-  discovered_ffprobe="$(command -v ffprobe 2>/dev/null || true)"
-  [[ -n "$discovered_ffprobe" ]] && FFPROBE="$discovered_ffprobe"
-fi
+[[ -x "$HANDBRAKECLI" ]] || die "HandBrakeCLI not found: $HANDBRAKECLI. Install with: brew install handbrake"
 
 if [[ "${SKIP_PRESET_CHECK:-0}" != "1" ]]; then
-  if ! "$HANDBRAKECLI" --preset-import-gui --preset-list 2>&1 | /usr/bin/grep -F -- "$PRESET" >/dev/null; then
+  if ! "$HANDBRAKECLI" "${PRESET_IMPORT_ARGS[@]}" --preset-list 2>&1 |
+      /usr/bin/sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | /usr/bin/grep -F -x -- "$PRESET" >/dev/null; then
     die "没有找到 HandBrake 预设: $PRESET"
   fi
+fi
+if [[ "$mode" == --doctor ]]; then
+  print -r -- 'Configuration and preset checks passed. No videos were moved or encoded.'
+  exit 0
 fi
 
 typeset -a valid_roots

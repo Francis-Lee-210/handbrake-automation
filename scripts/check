@@ -1,0 +1,18 @@
+#!/bin/zsh
+set -euo pipefail
+repo_root="${0:A:h:h}"
+builtin cd -q "$repo_root"
+for script in bin/* test-bin/* scripts/*; do
+  /bin/zsh -n "$script"
+done
+for metadata in workflows/**/*.plist workflows/**/*.wflow; do
+  /usr/bin/plutil -lint "$metadata"
+done
+for metadata in workflows/*/Contents/Info.plist; do
+  [[ "$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$metadata")" == "$(<VERSION)" ]] || {
+    print -ru2 -- "Bundle version differs from VERSION: $metadata"; exit 1
+  }
+done
+scripts/sync-workflows --check
+git diff --check
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v

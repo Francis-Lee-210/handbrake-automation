@@ -26,7 +26,7 @@ fi
 
 script_names=(
   video-compress launch-in-terminal
-  video-compress-fs.zsh video-compress-progress.zsh
+  video-compress-fs.zsh video-compress-progress.zsh video-compress-config.zsh
 )
 for name in "${script_names[@]}"; do
   source_file="$repo_root/bin/$name"

@@ -1,0 +1,34 @@
+name: Bug report / 故障报告
+description: Report a reproducible problem with installation or compression.
+title: '[Bug]: '
+body:
+  - type: markdown
+    attributes:
+      value: Use synthetic files or copies. Remove personal paths from logs; do not upload private videos. Security issues belong in private vulnerability reporting.
+  - type: input
+    id: version
+    attributes:
+      label: Project version and installation method
+      description: VERSION from the downloaded package, or Git commit; release ZIP or clone.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: macOS version, CPU and HandBrakeCLI version
+      placeholder: macOS 15, Apple Silicon, HandBrakeCLI ...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction, expected result and actual result
+      description: Include flat/recursive mode and relevant configuration; state whether this is Finder or CLI.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted diagnosis or log excerpt
+      description: Include the relevant --doctor output or encoding error without private filenames.
+      render: text

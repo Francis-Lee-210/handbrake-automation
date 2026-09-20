@@ -9,7 +9,7 @@
 	<key>CFBundleName</key>
 	<string>压缩视频-当前文件夹</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>0.2.0</string>
 	<key>NSServices</key>
 	<array>
 		<dict>

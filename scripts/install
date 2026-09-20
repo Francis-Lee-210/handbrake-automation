@@ -1,0 +1,151 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  /bin/cat <<'EOF'
+Usage: scripts/install [--dry-run] [--services-dir PATH]
+
+Install both Finder Quick Actions for the current user.
+The default destination is ~/Library/Services. Existing project workflows
+are preserved in a private .handbrake-automation-backups directory there.
+User configuration and videos are never modified by this installer.
+EOF
+}
+
+fail() { print -ru2 -- "Install: $*"; exit 1; }
+
+dry_run=0
+services_dir="$HOME/Library/Services"
+while (( $# )); do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --services-dir)
+      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || { usage >&2; exit 2; }
+      services_dir="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[[ "$(/usr/bin/uname -s)" == Darwin ]] || fail "macOS is required."
+
+repo_root="${0:A:h:h}"
+services_dir="${services_dir:a}"
+backup_root="$services_dir/.handbrake-automation-backups"
+workflow_names=("压缩视频-当前文件夹.workflow" "压缩视频-所有视频.workflow")
+bundle_ids=("com.litc.handbrake.compress-current-folder" "com.litc.handbrake.compress-all-videos")
+modes=(--flat --recursive)
+resource_names=(video-compress launch-in-terminal video-compress-fs.zsh video-compress-progress.zsh video-compress-config.zsh)
+
+validate_destination() {
+  local destination="$services_dir/$1" expected_id="$2" actual_id
+  local -a destination_symlinks
+  [[ ! -L "$destination" ]] || fail "Refusing symlink: $destination"
+  if [[ -e "$destination" ]]; then
+    [[ -d "$destination" && -f "$destination/Contents/Info.plist" ]] ||
+      fail "Unrecognized existing item: $destination"
+    destination_symlinks=("$destination"/**/*(DN@))
+    (( ${#destination_symlinks} == 0 )) || fail "Refusing symlink: ${destination_symlinks[1]}"
+    actual_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$destination/Contents/Info.plist" 2>/dev/null)" ||
+      fail "Cannot identify existing workflow: $destination"
+    [[ "$actual_id" == "$expected_id" ]] || fail "Unrecognized existing workflow: $destination"
+  fi
+}
+
+[[ ! -L "$services_dir" ]] || fail "Refusing symlink: $services_dir"
+[[ ! -e "$services_dir" || -d "$services_dir" ]] || fail "Not a directory: $services_dir"
+[[ ! -L "$backup_root" ]] || fail "Refusing symlink: $backup_root"
+[[ ! -e "$backup_root" || ( -d "$backup_root" && -O "$backup_root" ) ]] ||
+  fail "Backup directory must be owned by the current user: $backup_root"
+
+# Validate both workflows before creating or replacing anything.
+for index in 1 2; do
+  name="${workflow_names[$index]}"
+  source_bundle="$repo_root/workflows/$name"
+  [[ -d "$source_bundle" && ! -L "$source_bundle" ]] || fail "Missing workflow: $source_bundle"
+  symlinks=("$source_bundle"/**/*(DN@))
+  (( ${#symlinks} == 0 )) || fail "Source workflow contains a symlink: ${symlinks[1]}"
+  actual_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$source_bundle/Contents/Info.plist" 2>/dev/null)" ||
+    fail "Cannot read workflow: $source_bundle"
+  [[ "$actual_id" == "${bundle_ids[$index]}" ]] || fail "Unexpected bundle identifier: $source_bundle"
+  /usr/bin/plutil -lint "$source_bundle/Contents/Resources/document.wflow" >/dev/null ||
+    fail "Invalid workflow document: $source_bundle"
+  for resource in "${resource_names[@]}"; do
+    [[ -f "$source_bundle/Contents/Resources/$resource" ]] || fail "Missing resource: $source_bundle/Contents/Resources/$resource"
+  done
+  for resource in video-compress launch-in-terminal; do
+    [[ -x "$source_bundle/Contents/Resources/$resource" ]] || fail "Non-executable resource: $source_bundle/Contents/Resources/$resource"
+  done
+  validate_destination "$name" "${bundle_ids[$index]}"
+done
+
+if (( dry_run )); then
+  for name in "${workflow_names[@]}"; do
+    [[ ! -e "$services_dir/$name" ]] || print -r -- "Would back up: $services_dir/$name"
+    print -r -- "Would install: $services_dir/$name"
+  done
+  print -r -- "Configuration and videos are unchanged. No files were written."
+  exit 0
+fi
+
+umask 077
+/bin/mkdir -p "$services_dir"
+staging_dir="$(/usr/bin/mktemp -d "$services_dir/.handbrake-install.XXXXXX")"
+backup_dir=""
+installed_names=()
+backed_up_names=()
+committed=0
+cleanup_subshell=$ZSH_SUBSHELL
+TRAPEXIT() {
+  local exit_code=$? name recovery_failed=0
+  (( ZSH_SUBSHELL == cleanup_subshell )) || return "$exit_code"
+  if (( ! committed )); then
+    for name in "${installed_names[@]}"; do
+      /bin/mv "$services_dir/$name" "$staging_dir/$name" || recovery_failed=1
+    done
+    for name in "${backed_up_names[@]}"; do
+      if [[ ! -e "$services_dir/$name" && ! -L "$services_dir/$name" ]]; then
+        /bin/mv "$backup_dir/$name" "$services_dir/$name" || recovery_failed=1
+      else
+        recovery_failed=1
+      fi
+    done
+  fi
+  if (( recovery_failed )); then
+    print -ru2 -- "Automatic recovery needs attention. Preserved files: $backup_dir and $staging_dir"
+  else
+    /bin/rm -rf "$staging_dir"
+  fi
+  return "$exit_code"
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+for index in 1 2; do
+  name="${workflow_names[$index]}"
+  COPYFILE_DISABLE=1 /bin/cp -pR "$repo_root/workflows/$name" "$staging_dir/$name"
+  launcher="$services_dir/$name/Contents/Resources/launch-in-terminal"
+  workflow_command="${(q)launcher} ${modes[$index]} \"\$@\""
+  /usr/bin/plutil -replace actions.0.action.ActionParameters.COMMAND_STRING -string "$workflow_command" \
+    "$staging_dir/$name/Contents/Resources/document.wflow"
+done
+
+for index in 1 2; do
+  name="${workflow_names[$index]}"
+  validate_destination "$name" "${bundle_ids[$index]}"
+  if [[ -e "$services_dir/$name" ]]; then
+    if [[ -z "$backup_dir" ]]; then
+      /bin/mkdir -p "$backup_root"
+      /bin/chmod 700 "$backup_root"
+      backup_dir="$(/usr/bin/mktemp -d "$backup_root/install-$(/bin/date +%Y%m%d-%H%M%S).XXXXXX")"
+    fi
+    /bin/mv "$services_dir/$name" "$backup_dir/$name" || exit "$?"
+    backed_up_names+=("$name")
+  fi
+  /bin/mv "$staging_dir/$name" "$services_dir/$name" || exit "$?"
+  installed_names+=("$name")
+done
+committed=1
+print -r -- "Installed both Finder Quick Actions in: $services_dir"
+[[ -z "$backup_dir" ]] || print -r -- "Previous workflows preserved in: $backup_dir"
+print -r -- "Configuration and videos are unchanged."

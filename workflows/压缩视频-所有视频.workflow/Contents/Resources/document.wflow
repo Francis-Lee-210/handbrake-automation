@@ -59,7 +59,7 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>/Users/LITC/Library/Services/压缩视频-所有视频.workflow/Contents/Resources/launch-in-terminal --recursive "$@"</string>
+					<string>"$HOME/Library/Services/压缩视频-所有视频.workflow/Contents/Resources/launch-in-terminal" --recursive "$@"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>

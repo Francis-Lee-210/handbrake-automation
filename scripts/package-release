@@ -1,0 +1,94 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  print -r -- "Usage: scripts/package-release [--output-dir PATH]"
+  print -r -- "Create a versioned user distribution and SHA256SUMS (default: dist/)."
+}
+fail() { print -ru2 -- "Package: $*"; exit 1; }
+
+repo_root="${0:A:h:h}"
+output_dir="$repo_root/dist"
+while (( $# )); do
+  case "$1" in
+    --output-dir)
+      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || { usage >&2; exit 2; }
+      output_dir="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[[ "$(/usr/bin/uname -s)" == Darwin ]] || fail "macOS is required."
+output_dir="${output_dir:a}"
+[[ ! -L "$output_dir" ]] || fail "Refusing symlink: $output_dir"
+[[ ! -e "$output_dir" || -d "$output_dir" ]] || fail "Not a directory: $output_dir"
+[[ -f "$repo_root/VERSION" && ! -L "$repo_root/VERSION" ]] || fail "Missing regular VERSION file."
+release_version="$(<"$repo_root/VERSION")"
+[[ "$release_version" =~ '^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$' ]] || fail "Invalid VERSION: $release_version"
+release_name="handbrake-automation-$release_version"
+archive_name="$release_name.zip"
+
+# Keep this allowlist explicit: private reviews, history, test fixtures,
+# local configuration, and unexpected files inside workflows are excluded.
+release_files=(
+  VERSION LICENSE README.md README.zh-CN.md config.example
+  CONTRIBUTING.md SECURITY.md CHANGELOG.md
+  scripts/install scripts/uninstall
+  docs/usage.md docs/configuration.md docs/troubleshooting.md docs/open-source-design.md
+)
+resource_names=(video-compress launch-in-terminal video-compress-fs.zsh video-compress-progress.zsh video-compress-config.zsh)
+workflow_names=("压缩视频-当前文件夹.workflow" "压缩视频-所有视频.workflow")
+for name in "${resource_names[@]}"; do
+  release_files+=("bin/$name")
+done
+for workflow in "${workflow_names[@]}"; do
+  release_files+=("workflows/$workflow/Contents/Info.plist" "workflows/$workflow/Contents/Resources/document.wflow")
+  for name in "${resource_names[@]}"; do
+    release_files+=("workflows/$workflow/Contents/Resources/$name")
+  done
+done
+for relative_file in "${release_files[@]}"; do
+  source_file="$repo_root/$relative_file"
+  [[ -f "$source_file" && ! -L "$source_file" ]] || fail "Missing regular release file: $relative_file"
+  source_parent="${source_file:h}"
+  while [[ "$source_parent" != "$repo_root" ]]; do
+    [[ ! -L "$source_parent" ]] || fail "Refusing symlink directory: $source_parent"
+    source_parent="${source_parent:h}"
+  done
+done
+for name in "$archive_name" SHA256SUMS; do
+  [[ ! -L "$output_dir/$name" ]] || fail "Refusing symlink: $output_dir/$name"
+  [[ ! -e "$output_dir/$name" || -f "$output_dir/$name" ]] || fail "Not a regular file: $output_dir/$name"
+done
+"$repo_root/scripts/sync-workflows" --check
+
+umask 022
+staging_dir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/handbrake-release.XXXXXX")"
+cleanup_subshell=$ZSH_SUBSHELL
+TRAPEXIT() {
+  local exit_code=$?
+  (( ZSH_SUBSHELL == cleanup_subshell )) || return "$exit_code"
+  /bin/rm -rf "$staging_dir"
+  return "$exit_code"
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+for relative_file in "${release_files[@]}"; do
+  destination="$staging_dir/$release_name/$relative_file"
+  /bin/mkdir -p "${destination:h}"
+  COPYFILE_DISABLE=1 /bin/cp -p "$repo_root/$relative_file" "$destination"
+done
+(
+  builtin cd -q "$staging_dir"
+  # macOS zip omits the UTF-8 flag for Chinese names. Native bsdtar sets it
+  # correctly; normalize owner metadata and omit macOS extended attributes.
+  COPYFILE_DISABLE=1 /usr/bin/tar --no-mac-metadata --no-acls --no-xattrs --no-fflags \
+    --uid 0 --gid 0 --uname root --gname wheel -a -c -f "$archive_name" "$release_name"
+  /usr/bin/shasum -a 256 "$archive_name" > SHA256SUMS
+)
+/bin/mkdir -p "$output_dir"
+/bin/mv -f "$staging_dir/$archive_name" "$output_dir/$archive_name"
+/bin/mv -f "$staging_dir/SHA256SUMS" "$output_dir/SHA256SUMS"
+print -r -- "Created: $output_dir/$archive_name"
+print -r -- "Checksums: $output_dir/SHA256SUMS"
