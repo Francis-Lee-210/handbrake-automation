@@ -59,7 +59,7 @@
 				<key>ActionParameters</key>
 				<dict>
 					<key>COMMAND_STRING</key>
-					<string>/Users/LITC/Library/Services/压缩视频-当前文件夹.workflow/Contents/Resources/launch-in-terminal --flat "$@"</string>
+					<string>"$HOME/Library/Services/压缩视频-当前文件夹.workflow/Contents/Resources/launch-in-terminal" --flat "$@"</string>
 					<key>CheckedForUserDefaultShell</key>
 					<true/>
 					<key>inputMethod</key>

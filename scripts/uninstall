@@ -1,0 +1,102 @@
+#!/bin/zsh
+set -euo pipefail
+
+usage() {
+  /bin/cat <<'EOF'
+Usage: scripts/uninstall [--dry-run] [--services-dir PATH]
+
+Remove this project's two Finder Quick Actions from ~/Library/Services
+or the supplied directory. Workflows are moved into a private
+.handbrake-automation-backups directory and can be restored manually.
+User configuration and videos are retained.
+EOF
+}
+
+fail() { print -ru2 -- "Uninstall: $*"; exit 1; }
+
+dry_run=0
+services_dir="$HOME/Library/Services"
+while (( $# )); do
+  case "$1" in
+    --dry-run) dry_run=1; shift ;;
+    --services-dir)
+      (( $# >= 2 )) && [[ -n "$2" && "$2" != --* ]] || { usage >&2; exit 2; }
+      services_dir="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[[ "$(/usr/bin/uname -s)" == Darwin ]] || fail "macOS is required."
+services_dir="${services_dir:a}"
+backup_root="$services_dir/.handbrake-automation-backups"
+workflow_names=("压缩视频-当前文件夹.workflow" "压缩视频-所有视频.workflow")
+bundle_ids=("com.litc.handbrake.compress-current-folder" "com.litc.handbrake.compress-all-videos")
+present_names=()
+
+[[ ! -L "$services_dir" ]] || fail "Refusing symlink: $services_dir"
+[[ ! -e "$services_dir" || -d "$services_dir" ]] || fail "Not a directory: $services_dir"
+[[ ! -L "$backup_root" ]] || fail "Refusing symlink: $backup_root"
+[[ ! -e "$backup_root" || ( -d "$backup_root" && -O "$backup_root" ) ]] ||
+  fail "Backup directory must be owned by the current user: $backup_root"
+
+# Refuse unknown items before moving either workflow.
+for index in 1 2; do
+  name="${workflow_names[$index]}"
+  destination="$services_dir/$name"
+  [[ ! -L "$destination" ]] || fail "Refusing symlink: $destination"
+  [[ -e "$destination" ]] || continue
+  [[ -d "$destination" && -f "$destination/Contents/Info.plist" ]] ||
+    fail "Unrecognized existing item: $destination"
+  destination_symlinks=("$destination"/**/*(DN@))
+  (( ${#destination_symlinks} == 0 )) || fail "Refusing symlink: ${destination_symlinks[1]}"
+  actual_id="$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$destination/Contents/Info.plist" 2>/dev/null)" ||
+    fail "Cannot identify existing workflow: $destination"
+  [[ "$actual_id" == "${bundle_ids[$index]}" ]] || fail "Unrecognized existing workflow: $destination"
+  present_names+=("$name")
+done
+
+if (( dry_run )); then
+  for name in "${present_names[@]}"; do
+    print -r -- "Would move to recoverable backup: $services_dir/$name"
+  done
+  print -r -- "Configuration and videos are retained. No files were written."
+  exit 0
+fi
+if (( ${#present_names} == 0 )); then
+  print -r -- "No project workflows are installed in: $services_dir"
+  exit 0
+fi
+
+umask 077
+/bin/mkdir -p "$backup_root"
+/bin/chmod 700 "$backup_root"
+backup_dir="$(/usr/bin/mktemp -d "$backup_root/uninstall-$(/bin/date +%Y%m%d-%H%M%S).XXXXXX")"
+moved_names=()
+committed=0
+cleanup_subshell=$ZSH_SUBSHELL
+TRAPEXIT() {
+  local exit_code=$? name
+  (( ZSH_SUBSHELL == cleanup_subshell )) || return "$exit_code"
+  if (( ! committed )); then
+    for name in "${moved_names[@]}"; do
+      if [[ ! -e "$services_dir/$name" && ! -L "$services_dir/$name" ]]; then
+        /bin/mv "$backup_dir/$name" "$services_dir/$name" ||
+          print -ru2 -- "Restore manually from: $backup_dir/$name"
+      else
+        print -ru2 -- "Restore manually from: $backup_dir/$name"
+      fi
+    done
+  fi
+  return "$exit_code"
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+for name in "${present_names[@]}"; do
+  /bin/mv "$services_dir/$name" "$backup_dir/$name" || exit "$?"
+  moved_names+=("$name")
+done
+committed=1
+print -r -- "Quick Actions removed. Recoverable workflows: $backup_dir"
+print -r -- "Configuration and videos are retained."

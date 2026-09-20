@@ -52,6 +52,29 @@ prepare_command() {
   done
 
   cmd="SHOW_PROGRESS=1 "
+  # Terminal is a separate process; explicitly carry supported CLI overrides.
+  for config_key in VIDEO_COMPRESS_CONFIG XDG_CONFIG_HOME HANDBRAKECLI FFPROBE \
+      HANDBRAKE_PRESET HANDBRAKE_IMPORT_GUI ORIGINAL_DIR_NAME COMPRESSED_DIR_NAME \
+      LOG_FILE_NAME DISABLE_NOTIFICATIONS; do
+    if [[ -n "${(P)config_key:-}" ]]; then
+      config_value="${(P)config_key}"
+      case "$config_key" in
+        VIDEO_COMPRESS_CONFIG)
+          [[ "$config_value" == none ]] || config_value="${config_value:a}"
+          ;;
+        XDG_CONFIG_HOME) config_value="${config_value:a}" ;;
+        HANDBRAKECLI|FFPROBE)
+          if [[ "$config_value" == */* ]]; then
+            config_value="${config_value:a}"
+          else
+            resolved_executable="$(whence -p -- "$config_value" 2>/dev/null)" || true
+            [[ -z "$resolved_executable" ]] || config_value="${resolved_executable:a}"
+          fi
+          ;;
+      esac
+      cmd+="$config_key=${(q)config_value} "
+    fi
+  done
   cmd+="${(q)worker} ${(q)mode}"
 
   for target in "${targets[@]}"; do

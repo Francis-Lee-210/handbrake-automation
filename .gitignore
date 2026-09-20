@@ -1,5 +1,10 @@
 .DS_Store
 *.log
 /reviews/
+/dist/
+/.local/
+/.env
+/.env.*
+/config
 __pycache__/
 *.pyc

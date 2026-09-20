@@ -1,0 +1,22 @@
+# Optional configuration for both Finder and command-line use.
+# Copy to ~/.config/handbrake-automation/config (or $XDG_CONFIG_HOME/.../config).
+# Literal KEY=VALUE only; no export, commands, $HOME or ~ expansion.
+# Non-empty environment variables override this file. Updates never replace it.
+
+HANDBRAKE_PRESET=Fast 1080p30
+HANDBRAKE_IMPORT_GUI=0
+
+# Leave these commented for automatic discovery (PATH, Apple Silicon, Intel).
+# HANDBRAKECLI=/opt/homebrew/bin/HandBrakeCLI
+# FFPROBE=/opt/homebrew/bin/ffprobe
+
+# To use a preset saved in the HandBrake GUI, change the two preset lines above:
+# HANDBRAKE_PRESET=My hardware preset
+# HANDBRAKE_IMPORT_GUI=1
+
+# Keep directory names stable after starting a library.
+# ORIGINAL_DIR_NAME=Original Videos
+# COMPRESSED_DIR_NAME=Compressed Videos
+# LOG_FILE_NAME=video-compress.log
+# SHOW_PROGRESS=1
+# DISABLE_NOTIFICATIONS=1

@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-if [[ "${1:-}" == "--preset-import-gui" && "${2:-}" == "--preset-list" ]]; then
+if [[ "${1:-}" == "--preset-list" || ( "${1:-}" == "--preset-import-gui" && "${2:-}" == "--preset-list" ) ]]; then
+  print -r -- "    Fast 1080p30"
   print -r -- "    1080 原帧率 硬件加速"
   exit 0
 fi
