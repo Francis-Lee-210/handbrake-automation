@@ -1,8 +1,9 @@
-# Filesystem mutations require operator-owned, non-shared path ancestry.
+# Owned volumes enforce permissions; personal external volumes retain link checks.
 zmodload zsh/stat
 
 typeset -gA LOG_FDS
 typeset -gA VERIFIED_VOLUMES
+typeset -gA PERSONAL_VOLUME_ROOTS
 typeset -ga HELD_LOCKS STAGING_DIRS
 
 safe_component() {
@@ -22,15 +23,38 @@ safe_acl() {
   done
 }
 
-ownership_enabled() {
-  local directory="$1" device_number="$2" device enabled
-  [[ -n "${VERIFIED_VOLUMES[$device_number]-}" ]] && return 0
-  device="$(LC_ALL=C /bin/df -P "$directory" | /usr/bin/awk 'NR == 2 { print $1 }')" || return 1
-  [[ "$device" =~ '^/dev/disk[0-9]+(s[0-9]+)*$' ]] || return 1
-  enabled="$(/usr/sbin/diskutil info -plist "$device" 2>/dev/null |
-    /usr/bin/plutil -extract GlobalPermissionsEnabled raw -o - - 2>/dev/null)" || return 1
-  [[ "$enabled" == true ]] || return 1
-  VERIFIED_VOLUMES[$device_number]=1
+volume_policy() {
+  local directory="${1:a}" device_number="$2" device info enabled internal writable filesystem mount_point
+  REPLY="${VERIFIED_VOLUMES[$device_number]-}"
+  if [[ -z "$REPLY" ]]; then
+    device="$(LC_ALL=C /bin/df -P "$directory" | /usr/bin/awk 'NR == 2 { print $1 }')" || return 1
+    [[ "$device" =~ '^/dev/disk[0-9]+(s[0-9]+)*$' ]] || return 1
+    info="$(LC_ALL=C /usr/sbin/diskutil info -plist "$device" 2>/dev/null)" || return 1
+    enabled="$(print -r -- "$info" | /usr/bin/plutil -extract GlobalPermissionsEnabled raw -o - - 2>/dev/null)" || return 1
+    if [[ "$enabled" == true ]]; then
+      REPLY=owned
+    elif [[ "$enabled" == false ]]; then
+      internal="$(print -r -- "$info" | /usr/bin/plutil -extract Internal raw -o - - 2>/dev/null)" || return 1
+      writable="$(print -r -- "$info" | /usr/bin/plutil -extract WritableVolume raw -o - - 2>/dev/null)" || return 1
+      filesystem="$(print -r -- "$info" | /usr/bin/plutil -extract FilesystemType raw -o - - 2>/dev/null)" || return 1
+      mount_point="$(print -r -- "$info" | /usr/bin/plutil -extract MountPoint raw -o - - 2>/dev/null)" || return 1
+      # Publishing uses hard links, so only these personal-volume formats qualify.
+      [[ "$internal" == false && "$writable" == true && "$filesystem" == (apfs|hfs) ]] || return 1
+      [[ "$mount_point" == /Volumes/?* ]] || return 1
+      mount_point="${mount_point:a}"
+      [[ "$directory" == "$mount_point" || "$directory" == "$mount_point"/* ]] || return 1
+      REPLY=personal
+      PERSONAL_VOLUME_ROOTS[$device_number]="$mount_point"
+      print -ru2 -- "外置卷兼容模式: ${(q)mount_point}；仅用于个人可信目录，不保证多人共享时的权限隔离。"
+    else
+      return 1
+    fi
+    VERIFIED_VOLUMES[$device_number]="$REPLY"
+  fi
+  if [[ "$REPLY" == personal ]]; then
+    mount_point="${PERSONAL_VOLUME_ROOTS[$device_number]-}"
+    [[ -n "$mount_point" && ( "$directory" == "$mount_point" || "$directory" == "$mount_point"/* ) ]] || return 1
+  fi
 }
 
 safe_directory() {
@@ -47,13 +71,15 @@ safe_directory() {
     current="${ancestry[$index]}"
     zstat -L -H metadata -- "$current" 2>/dev/null || return 1
     (( (metadata[mode] & 8#170000) == 8#40000 )) || return 1
-    (( metadata[uid] == EUID || metadata[uid] == 0 )) || return 1
-    ownership_enabled "$current" "$metadata[device]" || return 1
-    if (( metadata[mode] & 8#22 )); then
-      # A sticky ancestor is safe only for a verified operator/root-owned child.
-      (( index < ${#ancestry} && metadata[mode] & 8#1000 )) || return 1
-      zstat -L -H child_metadata -- "${ancestry[$(( index + 1 ))]}" 2>/dev/null || return 1
-      (( child_metadata[uid] == EUID || child_metadata[uid] == 0 )) || return 1
+    volume_policy "$current" "$metadata[device]" || return 1
+    if [[ "$REPLY" != personal ]]; then
+      (( metadata[uid] == EUID || metadata[uid] == 0 )) || return 1
+      if (( metadata[mode] & 8#22 )); then
+        # A sticky ancestor is safe only for a verified operator/root-owned child.
+        (( index < ${#ancestry} && metadata[mode] & 8#1000 )) || return 1
+        zstat -L -H child_metadata -- "${ancestry[$(( index + 1 ))]}" 2>/dev/null || return 1
+        (( child_metadata[uid] == EUID || child_metadata[uid] == 0 )) || return 1
+      fi
     fi
     safe_acl "$current" || return 1
   done
@@ -62,7 +88,11 @@ safe_directory() {
 safe_regular_file() {
   local -A metadata
   zstat -L -H metadata -- "$1" 2>/dev/null || return 1
-  (( (metadata[mode] & 8#170000) == 8#100000 && metadata[nlink] == 1 && metadata[uid] == EUID && !(metadata[mode] & 8#22) )) || return 1
+  (( (metadata[mode] & 8#170000) == 8#100000 && metadata[nlink] == 1 )) || return 1
+  volume_policy "$1" "$metadata[device]" || return 1
+  if [[ "$REPLY" != personal ]]; then
+    (( metadata[uid] == EUID && !(metadata[mode] & 8#22) )) || return 1
+  fi
   safe_acl "$1"
 }
 
@@ -87,14 +117,14 @@ open_folder_log() {
     zstat -L -H previous -- "$log_file" || return 1
     exec {descriptor}>> "$log_file" || return 1
   else
-    # Protected ancestry plus exclusive creation; zsh redirections support UTF-8.
+    # Exclusive creation prevents truncating an existing log.
     (setopt NO_CLOBBER; umask 077; : > "$log_file") || return 1
     safe_regular_file "$log_file" || return 1
     zstat -L -H previous -- "$log_file" || return 1
     exec {descriptor}>> "$log_file" || return 1
   fi
   if ! zstat -H metadata -f "$descriptor" ||
-     (( (metadata[mode] & 8#170000) != 8#100000 || metadata[nlink] != 1 || metadata[uid] != EUID || metadata[mode] & 8#22 )) ||
+     (( (metadata[mode] & 8#170000) != 8#100000 || metadata[nlink] != 1 )) ||
      (( metadata[device] != previous[device] || metadata[inode] != previous[inode] )) ||
      ! safe_regular_file "$log_file"; then
     exec {descriptor}>&-

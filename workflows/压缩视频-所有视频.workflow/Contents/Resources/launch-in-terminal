@@ -26,51 +26,115 @@ if (( $# == 0 )); then
 fi
 
 resources_dir="${0:A:h}"
-worker="$resources_dir/video-compress"
 
-if [[ ! -x "$worker" ]]; then
-  print -ru2 -- "找不到可执行脚本: $worker"
-  exit 1
-fi
+prepare_command() {
+  worker="$resources_dir/video-compress"
 
-targets=()
-for target in "$@"; do
-  if [[ ! -d "$target" ]]; then
-    print -ru2 -- "不是有效的文件夹: $target"
+  if [[ ! -x "$worker" ]]; then
+    print -ru2 -- "找不到可执行脚本: $worker"
     exit 1
   fi
 
-  [[ "$target" == /* ]] || target="$PWD/$target"
-  # The trailing slash preserves path-ending newlines in command substitution.
-  if ! resolved_target="$(builtin cd -q -P -- "$target" && print -r -- "$PWD/")"; then
-    print -ru2 -- "无法访问文件夹: $target"
-    exit 1
-  fi
-  targets+=("${resolved_target%/}")
-done
+  targets=()
+  for target in "$@"; do
+    if [[ ! -d "$target" ]]; then
+      print -ru2 -- "不是有效的文件夹: $target"
+      exit 1
+    fi
 
-cmd="SHOW_PROGRESS=1 "
-cmd+="${(q)worker} ${(q)mode}"
+    [[ "$target" == /* ]] || target="$PWD/$target"
+    # The trailing slash preserves path-ending newlines in command substitution.
+    if ! resolved_target="$(builtin cd -q -P -- "$target" && print -r -- "$PWD/")"; then
+      print -ru2 -- "无法访问文件夹: $target"
+      exit 1
+    fi
+    targets+=("${resolved_target%/}")
+  done
 
-for target in "${targets[@]}"; do
-  cmd+=" ${(q)target}"
-done
+  cmd="SHOW_PROGRESS=1 "
+  cmd+="${(q)worker} ${(q)mode}"
 
-cmd+='; hb_exit_code=$?; echo; if (( hb_exit_code == 0 )); then echo "处理完成。可以关闭这个窗口。"; else echo "处理结束，但有失败项。请查看压缩视频/video-compress.log。"; fi; exit $hb_exit_code'
+  for target in "${targets[@]}"; do
+    cmd+=" ${(q)target}"
+  done
+
+  cmd+='; hb_exit_code=$?; echo; if (( hb_exit_code == 0 )); then echo "处理完成。可以关闭这个窗口。"; else echo "处理结束，但有失败项。请查看压缩视频/video-compress.log。"; fi; exit $hb_exit_code'
+}
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  prepare_command "$@"
   print -r -- "$cmd"
   exit 0
 fi
 
+umask 077
 command_dir="$(/usr/bin/mktemp -d "/tmp/handbrake-progress.XXXXXX")"
 command_file="$command_dir/run.command"
+task_file="$command_dir/task.zsh"
+terminal_file="$command_dir/progress.terminal"
+log_file="$command_dir/transcript.log"
 
-{
-  print -r -- "#!/bin/zsh"
-  print -r -- "set -o pipefail"
-  print -r -- "$cmd"
-} > "$command_file"
+print -r -- "启动/任务日志: $log_file" > "$log_file"
+# Retain diagnostics after exit; macOS may remove this private directory with /tmp.
+print -r -- "日志保留在临时目录；系统清理 /tmp 时可能删除。" >> "$log_file"
+/bin/cat "$log_file"
 
-/bin/chmod +x "$command_file"
-/usr/bin/open -a Terminal "$command_file"
+# Keep startup stderr in the same transcript, without piping the worker's TTY.
+set +e
+(
+  set -e
+  prepare_command "$@"
+  {
+    print -r -- '#!/bin/zsh'
+    print -r -- 'set -o pipefail'
+    print -r -- "$cmd"
+  } > "$task_file"
+
+  /bin/cat > "$command_file" <<'ZSH'
+#!/bin/zsh
+set -o pipefail
+umask 077
+command_dir="${0:A:h}"
+log_file="$command_dir/transcript.log"
+print -r -- "启动/任务日志: $log_file"
+print -r -- "日志保留在临时目录；系统清理 /tmp 时可能删除。"
+if ! /bin/mkdir "$command_dir/started" 2>/dev/null; then
+  message="此任务已启动或临时目录不可用。请从 Finder 重新发起。"
+  print -ru2 -- "$message"
+  print -r -- "$message" >> "$log_file"
+  print -r -- 'Replay exit code: 1' >> "$log_file"
+  exit 1
+fi
+
+# macOS script preserves the child's exit status and gives both streams a PTY.
+/usr/bin/script -q -a -F "$log_file" /bin/zsh -f "$command_dir/task.zsh" 2> "$command_dir/recorder.stderr"
+hb_exit_code=$?
+if [[ -s "$command_dir/recorder.stderr" ]]; then
+  /bin/cat "$command_dir/recorder.stderr" >> "$log_file"
+  /bin/cat "$command_dir/recorder.stderr" >&2
+fi
+print -r -- "Task exit code: $hb_exit_code" >> "$log_file"
+print -r -- "Task exit code: $hb_exit_code"
+print -r -- "启动/任务日志: $log_file"
+exit "$hb_exit_code"
+ZSH
+
+  /bin/chmod 700 "$command_file" "$task_file"
+
+  # Launch directly: an interactive shell's startup prompts can consume command text.
+  /usr/bin/plutil -create xml1 "$terminal_file"
+  /usr/bin/plutil -insert type -string 'Window Settings' "$terminal_file"
+  /usr/bin/plutil -insert name -string 'HandBrake 批量压缩' "$terminal_file"
+  /usr/bin/plutil -insert WindowTitle -string 'HandBrake 批量压缩' "$terminal_file"
+  /usr/bin/plutil -insert CommandString -string "/bin/zsh -f ${(q)command_file}" "$terminal_file"
+  /usr/bin/plutil -insert RunCommandAsShell -bool true "$terminal_file"
+  # 2 never closes the window; 1 closes it after a successful exit.
+  /usr/bin/plutil -insert shellExitAction -integer 2 "$terminal_file"
+  /usr/bin/open -a Terminal "$terminal_file"
+) >> "$log_file" 2>&1
+hb_exit_code=$?
+print -r -- "Launcher exit code: $hb_exit_code" >> "$log_file"
+if (( hb_exit_code != 0 )); then
+  /bin/cat "$log_file" >&2
+fi
+exit "$hb_exit_code"

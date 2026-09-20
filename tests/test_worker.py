@@ -96,10 +96,10 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertEqual(len(self.outputs()), 1)
 
-    def test_unavailable_ownership_query_fails_closed(self):
+    def test_unavailable_volume_query_fails_closed(self):
         script = REPO / "bin/video-compress-fs.zsh"
         result = subprocess.run(
-            ["/bin/zsh", "-fc", 'source "$1"; ownership_enabled() { return 1; }; safe_directory "$2"',
+            ["/bin/zsh", "-fc", 'source "$1"; volume_policy() { return 1; }; safe_directory "$2"',
              "test", str(script), str(self.root)],
             capture_output=True, text=True,
         )
